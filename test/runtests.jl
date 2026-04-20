@@ -30,14 +30,21 @@ angles = (0, 0, 0)
 ob3 = gauss3(center, width, angles, 1.0f0)
 
 image .+= 0.5 .* phantom(-shape[1]÷2+1:shape[1]÷2, -shape[2]÷2+1:shape[2]÷2, -shape[3]÷2+1:shape[3]÷2, [ob1, ob2, ob3], 3)
-img_itp = extrapolate(interpolate(image, BSpline(Cubic())), Interpolations.Flat())
+
+# Interpolant on mm axes (voxel_size=1mm, so mm == voxel indices)
+test_voxel_size = (1.0, 1.0, 1.0)
+img_itp = MRIRealign._interpolate(image, test_voxel_size)
 
 # Helper: create a moved image from known parameters
-function make_moved_image(img_itp, p, img_shape)
-    A = MRIRealign.create_affine_matrix(p, img_shape .÷ 2)
+# p = [rx, ry, rz, tx, ty, tz] with rotations in radians and translations in mm
+function make_moved_image(img_itp, p, img_shape; voxel_size=(1.0,1.0,1.0))
+    vx, vy, vz = voxel_size
+    center_mm = (img_shape .÷ 2) .* voxel_size
+    A = MRIRealign.create_affine_matrix(p, center_mm)
     img_moved = similar(Array{Float64}, img_shape)
     for i ∈ CartesianIndices(img_moved)
-        v = A \ SVector{4,Float64}(i[1], i[2], i[3], 1)
+        coord_mm = SVector{4,Float64}(i[1]*vx, i[2]*vy, i[3]*vz, 1)
+        v = A \ coord_mm
         img_moved[i] = abs(img_itp(v[1], v[2], v[3]))
     end
     return img_moved
@@ -78,17 +85,21 @@ end
 @testset "Gradient vs. finite differences (at p=0)" begin
     # At p=0 the analytical gradient (which uses grad_field evaluated at reference
     # coordinates) is exact because the transform is the identity.
-    inds = [Tuple(idx) .+ ntuple(_ -> rand(Float64), 3) .- 0.5 for idx ∈ CartesianIndices(image)]
+    # All coordinates are in mm (with voxel_size = 1mm, mm == voxel indices)
+    voxel_size = (1.0, 1.0, 1.0)
+    inds = [SVector{3,Float64}((Tuple(idx) .+ (rand(), rand(), rand()) .- (0.5, 0.5, 0.5)) .* voxel_size) for idx ∈ CartesianIndices(image)]
     reference = [img_itp(idx[1], idx[2], idx[3]) for idx in inds]
-    grad_field = [Interpolations.gradient(img_itp, idx[1], idx[2], idx[3]) for idx ∈ inds]
+    grad_field = [SVector{3,Float64}(Interpolations.gradient(img_itp, idx[1], idx[2], idx[3])) for idx ∈ inds]
     hess_field = nothing
 
-    c = size(image) .÷ 2
-    xyz_centered = [SVector{3,Float64}(ind[1] - c[1], ind[2] - c[2], ind[3] - c[3]) for ind in inds]
+    c_mm = SVector{3,Float64}((size(image) .÷ 2) .* voxel_size)
+    xyz_centered = [ind - c_mm for ind in inds]
+    
+    radius = 64.0
 
-    img_mov = extrapolate(interpolate(circshift(image, (10, 10, 10)), BSpline(Cubic())), Interpolations.Flat())
+    img_mov = MRIRealign._interpolate(circshift(image, (10, 10, 10)), voxel_size)
     diff_vals = similar(inds, Float64)
-    fgh! = MRIRealign.make_fgh_function(vec(reference), img_mov, c, inds, xyz_centered, grad_field, hess_field, diff_vals)
+    fgh! = MRIRealign.make_fgh_function(vec(reference), img_mov, c_mm, inds, xyz_centered, grad_field, hess_field, diff_vals, radius)
 
     G = zeros(6)
     H = zeros(6, 6)
@@ -102,17 +113,20 @@ end
     # The Gauss-Newton Hessian is J'J (positive semi-definite and symmetric),
     # not the true Hessian, so we test structural properties rather than
     # comparing to finite differences.
-    inds = [Tuple(idx) .+ ntuple(_ -> rand(Float64), 3) .- 0.5 for idx ∈ CartesianIndices(image)]
+    voxel_size = (1.0, 1.0, 1.0)
+    inds = [SVector{3,Float64}((Tuple(idx) .+ (rand(), rand(), rand()) .- (0.5, 0.5, 0.5)) .* voxel_size) for idx ∈ CartesianIndices(image)]
     reference = [img_itp(idx[1], idx[2], idx[3]) for idx in inds]
-    grad_field = [Interpolations.gradient(img_itp, idx[1], idx[2], idx[3]) for idx ∈ inds]
+    grad_field = [SVector{3,Float64}(Interpolations.gradient(img_itp, idx[1], idx[2], idx[3])) for idx ∈ inds]
     hess_field = nothing
 
-    c = size(image) .÷ 2
-    xyz_centered = [SVector{3,Float64}(ind[1] - c[1], ind[2] - c[2], ind[3] - c[3]) for ind in inds]
+    c_mm = SVector{3,Float64}((size(image) .÷ 2) .* voxel_size)
+    xyz_centered = [ind - c_mm for ind in inds]
 
-    img_mov = extrapolate(interpolate(circshift(image, (10, 10, 10)), BSpline(Cubic())), Interpolations.Flat())
+    radius = 64.0
+
+    img_mov = MRIRealign._interpolate(circshift(image, (10, 10, 10)), voxel_size)
     diff_vals = similar(inds, Float64)
-    fgh! = MRIRealign.make_fgh_function(vec(reference), img_mov, c, inds, xyz_centered, grad_field, hess_field, diff_vals)
+    fgh! = MRIRealign.make_fgh_function(vec(reference), img_mov, c_mm, inds, xyz_centered, grad_field, hess_field, diff_vals, radius)
 
     for p_test ∈ (zeros(6), [0.05, -0.03, 0.04, 1.0, -0.5, 0.5])
         G = zeros(6)

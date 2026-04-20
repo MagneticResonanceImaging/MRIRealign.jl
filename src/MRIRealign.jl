@@ -16,7 +16,7 @@ export realign!, create_rotation_matrix, create_affine_matrix, params_from_rigid
 
 # --- Top-level functions ---
 """
-    realign!(img; center, ref_mode, mask, fwhm, realign) -> motion_params
+    realign!(img; center, ref_mode, mask, fwhm, realign, voxel_size, radius, x_abstol) -> motion_params
 
 Estimate rigid-body (6-DOF) motion parameters from a 4-D MRI time series
 and, optionally, reslice the volumes to undo the estimated motion.
@@ -53,29 +53,50 @@ with exact analytic Jacobians of the rotation matrix.
 - `realign=true`: if `true`, `img` is overwritten in-place with the
   motion-corrected volumes. If `false`, only the parameters are
   estimated.
+- `voxel_size::NTuple{3}=(1.0, 1.0, 1.0)`: voxel dimensions in
+  **millimeters**, e.g. `(1.5, 1.5, 3.0)`.  Used to define the
+  interpolant on mm-spaced axes so that translations, the affine
+  matrix, and all spatial derivatives are natively in mm.
+- `radius::Real=64.0`: characteristic head radius in **millimeters**.
+  Rotation angles (in radians) are multiplied by `radius` to obtain
+  arc-length displacements in mm, placing rotations on the same footing
+  as translations inside the optimizer.
+- `x_abstol::Real=1e-3`: absolute convergence tolerance for the
+  optimizer, in **millimeters**.  The optimizer terminates when the
+  parameter step falls below this value.
+  The default of `1e-3` mm (1 μm) is far below any practical MRI
+  resolution.
 
 # Returns
 - `motion_params::Matrix{T}` of size `(6, t)`. Each column holds
   `[rx, ry, rz, tx, ty, tz]` — three rotation angles in **radians** and
-  three translations in **voxels** — for the corresponding time frame.
+  three translations in **millimeters** — for the corresponding time frame.
+
+Note that `voxel_size`, `radius`, and `x_abstol` can in any unit of translation,
+as long as all three are the same. The translations in the return `motion_params`
+are in the units of the input parameters.
+
 
 # Examples
 ```julia
-# Estimate and apply motion correction
+# Estimate and apply motion correction (1 mm isotropic voxels)
 params = realign!(img)
+
+# Specify voxel size and head radius
+params = realign!(img; voxel_size=(1.5, 1.5, 3.0), radius=70.0)
 
 # Estimate only (no reslicing), using frame 1 as reference
 params = realign!(img; ref_mode=1, realign=false)
 
-# With a brain mask and smoothing
-params = realign!(img; mask=brain_mask, fwhm=(5.0, 5.0, 5.0))
+# With a brain mask, smoothing, and a coarser tolerance (10 μm)
+params = realign!(img; mask=brain_mask, fwhm=(5.0, 5.0, 5.0), x_abstol=0.01)
 ```
 
 See also [`realign!(img, motion_params)`](@ref), [`create_affine_matrix`](@ref).
 
 ---
 
-    realign!(img, motion_params; center=size(img)[1:3] .÷ 2) -> motion_params
+    realign!(img, motion_params; center, voxel_size) -> motion_params
 
 Reslice `img` in-place using pre-computed `motion_params` (e.g., from a
 previous call to [`realign!`](@ref)).
@@ -84,11 +105,12 @@ previous call to [`realign!`](@ref)).
 - `img::AbstractArray{T,4}`: image array with dimensions `(x, y, z, t)`.
 - `motion_params::AbstractMatrix`: `(6, t)` matrix of motion parameters
   in the format `[rx, ry, rz, tx, ty, tz]` per column, with rotations in
-  radians and translations in voxels.
+  radians and translations in millimeters.
 
 # Keyword arguments
 - `center=size(img)[1:3] .÷ 2`: rotation center that was used when
   `motion_params` was estimated.
+- `voxel_size::NTuple{3}=(1.0,1.0,1.0)`: voxel dimensions in mm.
 
 # Returns
 - `motion_params` (the same matrix that was passed in).
@@ -106,7 +128,10 @@ function realign!(img::AbstractArray{Tin,4};
     ref_mode=:consensus,
     mask=trues(size(img)[1:3]),
     fwhm=nothing::Union{Nothing,NTuple{3}},
-    realign=true
+    realign=true,
+    voxel_size::NTuple{3}=(1.0, 1.0, 1.0),
+    radius::Real=64.0,
+    x_abstol::Real=1e-3 # stop when displacement step is <1 μm
 ) where Tin
 
     if Tin <: Complex
@@ -116,7 +141,6 @@ function realign!(img::AbstractArray{Tin,4};
         _img = img
         Treal = Tin
     end
-    T = Float64 # lower precision results in gradient inacurracies
 
     if ref_mode == :consensus
         t_refs = axes(_img, 4)
@@ -131,36 +155,49 @@ function realign!(img::AbstractArray{Tin,4};
 
     img_s = (fwhm === nothing || all(fwhm .== 0)) ? _img : smooth_image(_img, fwhm)
 
-    # interpolate all time frames
-    @views Tint = typeof(_interpolate(img_s[:, :, :, 1]))
+    voxel_size = Float64.(voxel_size)
+    vx, vy, vz = voxel_size
+    center = SVector{3,Float64}(center)
+    center_mm = center .* voxel_size
+    radius = Float64(radius)
+
+    # Interpolate all time frames on mm-spaced axes
+    @views Tint = typeof(_interpolate(img_s[:, :, :, 1], voxel_size))
     img_itp = Vector{Tint}(undef, size(img_s, 4))
     @tasks for t ∈ eachindex(img_itp)
         vol = img_s[:, :, :, t]
-        vol ./= quantile(vec(vol), T(0.9))
-        img_itp[t] = _interpolate(vol)
+        vol ./= quantile(vec(vol), 0.9)
+        img_itp[t] = _interpolate(vol, voxel_size)
     end
 
-    # random shifts seem to help with the speed of convergence (cf. SPM)
-    mask_inds = [SVector{3,T}(Tuple(idx)) + SVector{3,T}(rand(T), rand(T), rand(T)) - SVector{3,T}(0.5, 0.5, 0.5) for idx ∈ findall(mask)]
+    # Mask positions in mm (with random sub-voxel jitter for convergence, cf. SPM)
+    mask_inds = [SVector{3}((idx[1] + rand() - 0.5) * vx,
+                            (idx[2] + rand() - 0.5) * vy,
+                            (idx[3] + rand() - 0.5) * vz)
+                 for idx ∈ CartesianIndices(mask) if mask[idx]]
 
-    # Precompute centered coordinates (mask position minus center) — constant across all references and optimizer iterations
-    c_svec = SVector{3,T}(T(center[1]), T(center[2]), T(center[3]))
-    xyz_centered = [ind - c_svec for ind ∈ mask_inds]
+    # Precompute centered coordinates (mask position minus center in mm)
+    xyz_centered = [ind - center_mm for ind ∈ mask_inds]
 
-    _motion_params = Array{T}(undef, 6, length(img_itp), length(t_refs))
+    _motion_params = Array{Float64}(undef, 6, length(img_itp), length(t_refs))
     for (i_ref, t_ref) ∈ enumerate(t_refs)
         reference = [img_itp[t_ref](ind[1], ind[2], ind[3]) for ind ∈ mask_inds]
-        grad_field = [SVector{3,T}(gradient(img_itp[t_ref], ind[1], ind[2], ind[3])) for ind ∈ mask_inds]
+        grad_field = [SVector{3}(gradient(img_itp[t_ref], ind[1], ind[2], ind[3])) for ind ∈ mask_inds]
         # hess_field = [hessian(img_itp[t_ref], idx[1], idx[2], idx[3]) for idx ∈ mask_inds]
         hess_field = nothing # using the Gauss-Newton approximation
 
-        p0 = zeros(T, 6)
+        p0_mm = zeros(6)
         @tasks for t ∈ axes(img_s, 4)
-            @local diff_vals = similar(mask_inds, T)
+            @local diff_vals = similar(mask_inds, Float64)
 
-            fgh! = make_fgh_function(reference, img_itp[t], center, mask_inds, xyz_centered, grad_field, hess_field, diff_vals)
-            res = optimize(NLSolversBase.only_fgh!(fgh!), p0, NewtonTrustRegion())
-            _motion_params[:, t, i_ref] .= Optim.minimizer(res)
+            fgh! = make_fgh_function(reference, img_itp[t], center_mm, mask_inds, xyz_centered,
+                                     grad_field, hess_field, diff_vals, radius)
+            res = optimize(NLSolversBase.only_fgh!(fgh!), p0_mm, NewtonTrustRegion(),
+                           Optim.Options(; x_abstol))
+            p_mm = Optim.minimizer(res)
+            # Convert arc-lengths back to radians; translations are already in mm
+            _motion_params[1:3, t, i_ref] .= p_mm[1:3] ./ radius
+            _motion_params[4:6, t, i_ref] .= p_mm[4:6]
         end
     end
 
@@ -173,20 +210,23 @@ function realign!(img::AbstractArray{Tin,4};
     end
 
     if realign
-        realign!(img, motion_params; center)
+        realign!(img, motion_params; center, voxel_size)
     end
 
     return Treal.(motion_params)
 end
 
 
-function realign!(img::AbstractArray{T,4}, motion_params; center=size(img)[1:3] .÷ 2) where T
+function realign!(img::AbstractArray{T,4}, motion_params; center=size(img)[1:3] .÷ 2, voxel_size::NTuple{3}=(1.0,1.0,1.0)) where T
+    voxel_size = Float64.(voxel_size)
+    vx, vy, vz = voxel_size
+    center_mm = SVector{3,Float64}(center) .* voxel_size
     @tasks for t ∈ axes(img, 4)
         vol = @view img[:, :, :, t]
-        img_itp = _interpolate(vol)
-        A = create_affine_matrix(motion_params[:, t], center)
+        img_itp = _interpolate(vol, voxel_size)
+        A = create_affine_matrix(motion_params[:, t], center_mm)
         @inbounds for idx ∈ CartesianIndices(vol)
-            v = A * SVector{4,Float64}(idx[1], idx[2], idx[3], 1)
+            v = A * SVector{4,Float64}(idx[1]*vx, idx[2]*vy, idx[3]*vz, 1)
             vol[idx] = img_itp(v[1], v[2], v[3])
         end
     end
@@ -195,12 +235,16 @@ end
 
 
 # --- Combined f, g, h! for Optim.only_fg! or Newton trust-region ---
-function make_fgh_function(reference::AbstractVector{T}, mov_itp, center, mask_inds, xyz_centered, grad_field, hess_field, diff_vals) where T
-    function fgh!(F, G, H, p)
-        # Residuals
+function make_fgh_function(reference, mov_itp, center, mask_inds, xyz_centered, grad_field, hess_field, diff_vals, radius)
+    function fgh!(F, G, H, p_mm)
+        # p_mm = [arc_x, arc_y, arc_z, tx, ty, tz] — all in mm.
+        # Convert arc-lengths to radians for the affine matrix.
+        p = SVector{6}(p_mm[1]/radius, p_mm[2]/radius, p_mm[3]/radius, p_mm[4], p_mm[5], p_mm[6])
+
+        # Residuals — all coordinates are in mm
         A = create_affine_matrix(p, center)
         @inbounds for (n, ind) ∈ enumerate(mask_inds)
-            v = A * SVector{4,T}(ind[1], ind[2], ind[3], 1)
+            v = A * SVector{4}(ind[1], ind[2], ind[3], 1.0)
             diff_vals[n] = reference[n] - mov_itp(v[1], v[2], v[3])
         end
 
@@ -238,23 +282,29 @@ function make_fgh_function(reference::AbstractVector{T}, mov_itp, center, mask_i
 
         # Per-voxel contributions — direct dot-product formulation avoids
         # constructing the 3×6 Jacobian matrix Jx and the matrix-vector
-        # product Jx' * gI.  Instead we compute JtgI (the 6-vector) directly:
-        #   JtgI[1:3] = [dot(dRdrx*xyz, gI), dot(dRdry*xyz, gI), dot(dRdrz*xyz, gI)]
-        #   JtgI[4:6] = gI                   (identity block for translations)
+        # product Jx' * gI.  Instead we compute JtgI (the 6-vector) directly.
+        #
+        # The optimizer variable is p_mm = (arc_x, arc_y, arc_z, tx, ty, tz)
+        # where arc_i = angle_i * radius.  By the chain rule:
+        #   ∂f/∂arc_i = (∂f/∂angle_i) * (∂angle_i/∂arc_i) = (∂f/∂angle_i) / radius
+        # For translations:  ∂f/∂t_mm = gI  (identity, interpolant is in mm)
         @inbounds for i ∈ eachindex(mask_inds)
-            xyz = xyz_centered[i]    # precomputed: mask_inds[i] - center
-            gI  = grad_field[i]      # ∂I/∂x, shape (3,)
+            xyz = xyz_centered[i]    # precomputed: mask_inds[i] - center (mm)
+            gI  = grad_field[i]      # ∂I/∂x_mm
             r   = diff_vals[i]
 
             # Rotation part: dot(dR * xyz, gI) for each of rx, ry, rz
             drx_xyz = dRdrx * xyz
             dry_xyz = dRdry * xyz
             drz_xyz = dRdrz * xyz
-            JtgI = SVector{6,T}(
-                dot(drx_xyz, gI),
-                dot(dry_xyz, gI),
-                dot(drz_xyz, gI),
-                gI[1], gI[2], gI[3]  # translation part (identity block)
+
+            # Jacobian w.r.t. p_mm.  Rotation components are divided by
+            # radius (chain rule: ∂/∂arc = ∂/∂angle / radius).
+            JtgI = SVector{6}(
+                dot(drx_xyz, gI) / radius,
+                dot(dry_xyz, gI) / radius,
+                dot(drz_xyz, gI) / radius,
+                gI[1], gI[2], gI[3]
             )
 
             if G !== nothing
@@ -266,7 +316,7 @@ function make_fgh_function(reference::AbstractVector{T}, mov_itp, center, mask_i
                 if hess_field !== nothing
                     # Full Hessian correction requires the actual Jacobian matrix
                     Jx = hcat(drx_xyz, dry_xyz, drz_xyz,
-                              SMatrix{3,3,T}(1,0,0, 0,1,0, 0,0,1))
+                              SMatrix{3,3,Float64}(1,0,0, 0,1,0, 0,0,1))
                     HI = hess_field[i]       # ∂²I/∂x², shape (3×3)
                     H .-= (2r) .* (Jx' * HI * Jx)
                 end
@@ -295,6 +345,16 @@ function smooth_image(img::AbstractArray{T,4}, fwhm::NTuple{3}) where {T<:Real}
 end
 
 _interpolate(x) = extrapolate(interpolate(x, BSpline(Cubic())), Interpolations.Flat())
+
+function _interpolate(x, voxel_size::NTuple{3})
+    itp = interpolate(x, BSpline(Cubic()))
+    nx, ny, nz = size(x)
+    vx, vy, vz = voxel_size
+    ax = range(vx, step=vx, length=nx)
+    ay = range(vy, step=vy, length=ny)
+    az = range(vz, step=vz, length=nz)
+    return extrapolate(Interpolations.scale(itp, ax, ay, az), Interpolations.Flat())
+end
 
 
 """
@@ -335,12 +395,15 @@ Build a 4×4 homogeneous rigid-body transformation matrix from the
 6-element parameter vector `p = [rx, ry, rz, tx, ty, tz]`.
 
 - `rx, ry, rz`: rotation angles in **radians** (ZYX convention).
-- `tx, ty, tz`: translations in **voxels**.
-- `center`: 3-element rotation center `(cx, cy, cz)` in voxel coordinates.
+- `tx, ty, tz`: translations in the same spatial units as `center`
+  (millimeters when used with scaled interpolants).
+- `center`: 3-element rotation center in the same spatial units as
+  the translations.
 
 The transformation is  `x′ = R * (x - center) + center + t`, so that
 rotations are applied about `center` and translations are added
-afterward.
+afterward.  The matrix operates in whatever coordinate system `center`
+and the translations share.
 
 # Examples
 ```jldoctest
@@ -372,7 +435,8 @@ end
 
 Extract the 6-DOF parameter vector `[rx, ry, rz, tx, ty, tz]` from a
 4×4 homogeneous rigid-body matrix `A` and the rotation `center` that was
-used to construct it.
+used to construct it.  Translations are returned in the same spatial
+units as `center`.
 
 This is the inverse of [`create_affine_matrix`](@ref):
 
