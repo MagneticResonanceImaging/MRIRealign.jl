@@ -1,6 +1,6 @@
 name = "MRIRealign"
 uuid = "4447969b-3c70-418c-8ae2-3a391da519f9"
-version = "0.2.0"
+version = "0.2.1-DEV"
 authors = ["Jakob Asslaender <jakob.asslaender@nyumc.org>"]
 
 [deps]
