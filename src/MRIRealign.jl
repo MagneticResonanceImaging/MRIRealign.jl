@@ -1,6 +1,5 @@
 module MRIRealign
 
-using Images
 using NLSolversBase
 using Optim
 using StaticArrays
